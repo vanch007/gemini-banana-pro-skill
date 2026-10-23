@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
+import mimetypes
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -18,6 +22,7 @@ sys.path.insert(0, str(ROOT / "vendor"))
 
 try:
     import browser_cookie3 as bc3  # noqa: E402
+    from curl_cffi import requests as http_requests  # noqa: E402
     from gemini_webapi import GeminiClient, logger, set_log_level  # noqa: E402
     from gemini_webapi.constants import Model  # noqa: E402
     from gemini_webapi.exceptions import AuthError, GeminiError  # noqa: E402
@@ -118,6 +123,33 @@ def load_cookies_with_meta(path: str | Path) -> tuple[dict[str, str], dict[str, 
 
 DEFAULT_COOKIE_PATH = ROOT / "cookies.json"
 CHROME_ROOT = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+DEFAULT_COCKPIT_DIR = Path.home() / ".antigravity_cockpit"
+COCKPIT_IMAGE_MODEL = "gemini-3.1-flash-image"
+COCKPIT_CLIENT_KEY = "antigravity_enterprise"
+COCKPIT_CLIENT_ID = os.getenv("ANTIGRAVITY_CLIENT_ID", "")
+COCKPIT_CLIENT_SECRET = os.getenv("ANTIGRAVITY_CLIENT_SECRET", "")
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+COCKPIT_ENDPOINTS = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal",
+    "https://cloudcode-pa.googleapis.com/v1internal",
+]
+COCKPIT_VERSION = os.getenv("ANTIGRAVITY_VERSION", "4.1.31")
+COCKPIT_USER_AGENT = os.getenv(
+    "ANTIGRAVITY_USER_AGENT",
+    (
+        f"Antigravity/{COCKPIT_VERSION} "
+        "(Macintosh; Intel Mac OS X 10_15_7) "
+        "Chrome/132.0.6834.160 Electron/39.2.3"
+    ),
+)
+COCKPIT_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"},
+]
 SUPPORTED_BROWSERS = {
     "auto": None,
     "chrome": "chrome",
@@ -151,6 +183,354 @@ USEFUL_COOKIE_NAMES = {
     "APISID",
     "SAPISID",
 }
+
+
+def cockpit_accounts_dir(args: argparse.Namespace) -> Path:
+    root = Path(getattr(args, "cockpit_dir", None) or DEFAULT_COCKPIT_DIR).expanduser()
+    return root / "accounts"
+
+
+def load_cockpit_accounts(args: argparse.Namespace) -> list[dict[str, Any]]:
+    accounts_dir = cockpit_accounts_dir(args)
+    if not accounts_dir.exists():
+        raise SystemExit(f"Cockpit account directory does not exist: {accounts_dir}")
+    accounts: list[dict[str, Any]] = []
+    for path in sorted(accounts_dir.glob("*.json")):
+        try:
+            account = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(account, dict):
+            continue
+        account["_path"] = str(path)
+        accounts.append(account)
+    return accounts
+
+
+def cockpit_model_names(account: dict[str, Any]) -> list[str]:
+    quota = account.get("quota") if isinstance(account.get("quota"), dict) else {}
+    models = quota.get("models") if isinstance(quota, dict) else []
+    names: list[str] = []
+    for model in models if isinstance(models, list) else []:
+        if isinstance(model, str):
+            name = model
+        elif isinstance(model, dict):
+            name = model.get("model_id") or model.get("id") or model.get("name")
+        else:
+            name = None
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def cockpit_subscription_tier(account: dict[str, Any]) -> str:
+    quota = account.get("quota") if isinstance(account.get("quota"), dict) else {}
+    value = quota.get("subscription_tier") if isinstance(quota, dict) else None
+    return str(value or "").strip().lower()
+
+
+def cockpit_is_pro(account: dict[str, Any]) -> bool:
+    tier = cockpit_subscription_tier(account)
+    return tier == "g1-pro-tier" or ("pro" in tier and "free" not in tier)
+
+
+def cockpit_current_account_id(args: argparse.Namespace) -> str | None:
+    index_path = cockpit_accounts_dir(args).parent / "accounts.json"
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = payload.get("current_account_id") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def cockpit_account_priority(
+    account: dict[str, Any],
+    current_account_id: str | None,
+) -> tuple[int, int, str]:
+    tier = cockpit_subscription_tier(account)
+    is_pro = tier == "g1-pro-tier" or ("pro" in tier and "free" not in tier)
+    is_current = bool(current_account_id and account.get("id") == current_account_id)
+    return (
+        0 if is_pro else 1,
+        0 if is_current else 1,
+        str(account.get("email") or account.get("id") or ""),
+    )
+
+
+def select_cockpit_accounts(args: argparse.Namespace) -> list[dict[str, Any]]:
+    accounts = [
+        account
+        for account in load_cockpit_accounts(args)
+        if not account.get("disabled") and not account.get("proxy_disabled")
+    ]
+    account_id = getattr(args, "cockpit_account_id", None)
+    account_email = getattr(args, "cockpit_account_email", None)
+    if account_id:
+        accounts = [account for account in accounts if account.get("id") == account_id]
+    if account_email:
+        accounts = [
+            account
+            for account in accounts
+            if str(account.get("email", "")).lower() == account_email.lower()
+        ]
+    if not accounts:
+        selector = account_id or account_email or "enabled accounts"
+        raise SystemExit(f"No Cockpit account matched: {selector}")
+    capable = [account for account in accounts if COCKPIT_IMAGE_MODEL in cockpit_model_names(account)]
+    selected = capable or accounts
+    if account_id or account_email:
+        return selected
+    current_account_id = cockpit_current_account_id(args)
+    return sorted(
+        selected,
+        key=lambda account: cockpit_account_priority(account, current_account_id),
+    )
+
+
+def resolve_cockpit_oauth_client(cockpit_dir: Path | None = None) -> tuple[str, str]:
+    client_id = os.getenv("ANTIGRAVITY_CLIENT_ID") or os.getenv("COCKPIT_CLIENT_ID") or COCKPIT_CLIENT_ID
+    client_secret = os.getenv("ANTIGRAVITY_CLIENT_SECRET") or os.getenv("COCKPIT_CLIENT_SECRET") or COCKPIT_CLIENT_SECRET
+    if client_id and client_secret:
+        return client_id, client_secret
+    root = cockpit_dir or DEFAULT_COCKPIT_DIR
+    oauth_file = root / "oauth_client.json"
+    if oauth_file.exists():
+        try:
+            data = json.loads(oauth_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cid = data.get("client_id") or data.get("clientId") or ""
+                csecret = data.get("client_secret") or data.get("clientSecret") or ""
+                if cid and csecret:
+                    return str(cid), str(csecret)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return client_id, client_secret
+
+
+def cockpit_oauth_clients(preferred_key: str | None, cockpit_dir: Path | None = None) -> list[dict[str, str]]:
+    clients: list[dict[str, str]] = []
+    default_id, default_secret = resolve_cockpit_oauth_client(cockpit_dir)
+    if default_id and default_secret:
+        clients.append(
+            {
+                "key": COCKPIT_CLIENT_KEY,
+                "client_id": default_id,
+                "client_secret": default_secret,
+            }
+        )
+    raw = os.getenv("ANTIGRAVITY_OAUTH_CLIENTS", "")
+    for entry in raw.split(";"):
+        parts = [part.strip() for part in entry.split("|")]
+        if len(parts) < 3 or not all(parts[:3]):
+            continue
+        key, client_id, client_secret = parts[:3]
+        clients = [client for client in clients if client["key"] != key.lower()]
+        clients.append(
+            {
+                "key": key.lower(),
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
+        )
+    wanted = [
+        value
+        for value in [
+            (preferred_key or "").strip().lower(),
+            os.getenv("ANTIGRAVITY_OAUTH_CLIENT_KEY", "").strip().lower(),
+            COCKPIT_CLIENT_KEY,
+        ]
+        if value
+    ]
+    ordered: list[dict[str, str]] = []
+    for key in wanted:
+        ordered.extend(client for client in clients if client["key"] == key and client not in ordered)
+    ordered.extend(client for client in clients if client not in ordered)
+    return ordered
+
+
+def refresh_cockpit_access_token(account: dict[str, Any], args: argparse.Namespace) -> str:
+    token = account.get("token") if isinstance(account.get("token"), dict) else {}
+    refresh_token = token.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise RuntimeError("account does not contain token.refresh_token")
+    cockpit_dir = Path(getattr(args, "cockpit_dir", None) or DEFAULT_COCKPIT_DIR).expanduser()
+    clients = cockpit_oauth_clients(token.get("oauth_client_key"), cockpit_dir=cockpit_dir)
+    if not clients:
+        raise RuntimeError(
+            "No Antigravity OAuth client credentials configured. "
+            "Set ANTIGRAVITY_CLIENT_ID and ANTIGRAVITY_CLIENT_SECRET environment variables, "
+            "or configure ~/.antigravity_cockpit/oauth_client.json."
+        )
+    errors: list[str] = []
+    for client in clients:
+        response = http_requests.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": client["client_id"],
+                "client_secret": client["client_secret"],
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            proxy=args.proxy,
+            timeout=30,
+            verify=not args.skip_verify,
+        )
+        if response.ok:
+            payload = response.json()
+            access_token = payload.get("access_token")
+            if isinstance(access_token, str) and access_token:
+                return access_token
+        errors.append(f"{client['key']}: HTTP {response.status_code}")
+    raise RuntimeError("OAuth refresh failed: " + ", ".join(errors))
+
+
+def cockpit_headers(access_token: str) -> dict[str, str]:
+    machine_source = os.getenv("ANTIGRAVITY_MACHINE_ID") or f"{os.uname().nodename}:{uuid.getnode()}"
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": COCKPIT_USER_AGENT,
+        "x-client-name": "antigravity",
+        "x-client-version": COCKPIT_VERSION,
+        "x-machine-id": hashlib.sha256(machine_source.encode("utf-8")).hexdigest(),
+        "x-vscode-sessionid": str(uuid.uuid4()),
+    }
+
+
+def fetch_cockpit_project_id(access_token: str, args: argparse.Namespace) -> str:
+    response = http_requests.post(
+        COCKPIT_ENDPOINTS[0] + ":loadCodeAssist",
+        headers=cockpit_headers(access_token),
+        json={"metadata": {"ideType": "ANTIGRAVITY"}},
+        proxy=args.proxy,
+        timeout=30,
+        verify=not args.skip_verify,
+    )
+    response.raise_for_status()
+    value = response.json().get("cloudaicompanionProject")
+    if isinstance(value, dict):
+        value = value.get("id")
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("loadCodeAssist did not return cloudaicompanionProject")
+    return value
+
+
+def cockpit_aspect_ratio(value: str | None) -> str:
+    if not value:
+        return "1:1"
+    if ":" in value:
+        return value
+    if "x" not in value.lower():
+        return "1:1"
+    try:
+        width, height = (float(item) for item in value.lower().split("x", 1))
+        ratio = width / height
+    except (ValueError, ZeroDivisionError):
+        return "1:1"
+    targets = {
+        "21:9": 21 / 9,
+        "16:9": 16 / 9,
+        "9:16": 9 / 16,
+        "4:3": 4 / 3,
+        "3:4": 3 / 4,
+        "3:2": 3 / 2,
+        "2:3": 2 / 3,
+        "5:4": 5 / 4,
+        "4:5": 4 / 5,
+        "1:1": 1.0,
+    }
+    return min(targets, key=lambda name: abs(targets[name] - ratio))
+
+
+def cockpit_image_size(args: argparse.Namespace) -> str | None:
+    if args.image_size:
+        return args.image_size.upper()
+    return {
+        "standard": "1K",
+        "1k": "1K",
+        "medium": "2K",
+        "2k": "2K",
+        "hd": "4K",
+        "4k": "4K",
+    }.get((args.quality or "").lower())
+
+
+def cockpit_image_part(path_value: str) -> dict[str, Any]:
+    path = Path(path_value).expanduser()
+    if not path.exists():
+        raise SystemExit(f"Image file does not exist: {path}")
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    return {
+        "inlineData": {
+            "mimeType": mime_type,
+            "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+        }
+    }
+
+
+def build_cockpit_body(args: argparse.Namespace, project_id: str) -> dict[str, Any]:
+    parts = [{"text": args.prompt}]
+    parts.extend(cockpit_image_part(path) for path in args.image)
+    image_config = {"aspectRatio": cockpit_aspect_ratio(args.size)}
+    image_size = cockpit_image_size(args)
+    if image_size:
+        image_config["imageSize"] = image_size
+    return {
+        "project": project_id,
+        "requestId": f"image_gen/{int(datetime.now().timestamp() * 1000)}/{uuid.uuid4()}/12",
+        "model": COCKPIT_IMAGE_MODEL,
+        "userAgent": "antigravity",
+        "requestType": "image_gen",
+        "request": {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"candidateCount": 1, "imageConfig": image_config},
+            "safetySettings": COCKPIT_SAFETY_SETTINGS,
+        },
+    }
+
+
+def request_cockpit_image(access_token: str, body: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    last_error = "unknown error"
+    for endpoint in COCKPIT_ENDPOINTS:
+        response = http_requests.post(
+            endpoint + ":generateContent",
+            headers=cockpit_headers(access_token),
+            json=body,
+            proxy=args.proxy,
+            timeout=args.request_timeout,
+            verify=not args.skip_verify,
+        )
+        if response.ok:
+            return response.json()
+        last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+        if response.status_code not in {404, 408, 429, 500, 502, 503, 504}:
+            break
+    raise RuntimeError(last_error)
+
+
+def extract_cockpit_images(payload: dict[str, Any]) -> list[tuple[str, bytes]]:
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    candidates = response.get("candidates") if isinstance(response, dict) else []
+    images: list[tuple[str, bytes]] = []
+    for candidate in candidates if isinstance(candidates, list) else []:
+        content = candidate.get("content") if isinstance(candidate, dict) else {}
+        parts = content.get("parts") if isinstance(content, dict) else []
+        for part in parts if isinstance(parts, list) else []:
+            inline = part.get("inlineData") if isinstance(part, dict) else None
+            if not isinstance(inline, dict) or not inline.get("data"):
+                continue
+            images.append(
+                (
+                    str(inline.get("mimeType") or "image/png"),
+                    base64.b64decode(inline["data"]),
+                )
+            )
+    return images
+
+
+def cockpit_extension(mime_type: str) -> str:
+    return {"image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(mime_type, ".png")
 def save_cookie_dict(
     path: str | Path,
     cookies: dict[str, str],
@@ -630,6 +1010,9 @@ async def run_image_with_cookies(args: argparse.Namespace, json_cookies: dict[st
 
 
 async def run_image(args: argparse.Namespace) -> int:
+    if args.auth_source == "cockpit":
+        return await run_cockpit_image(args)
+
     cookie_path = resolve_cookie_path(args)
     if should_use_account_pool(args):
         candidates = await collect_chrome_account_candidates(args)
@@ -692,7 +1075,351 @@ async def run_image(args: argparse.Namespace) -> int:
         await cleanup(client, args, json_cookies, cookie_path)
 
 
+async def run_cockpit_image(args: argparse.Namespace) -> int:
+    failures: list[str] = []
+    accounts = select_cockpit_accounts(args)
+    for account in accounts:
+        email = str(account.get("email") or "-")
+        account_id = str(account.get("id") or "-")
+        try:
+            result = await generate_cockpit_with_account(args, account)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print("Saved images:")
+                for item in result["images"]:
+                    print(f"  {item['path']} ({item['mime_type']})")
+                print(f"Account: cockpit:{account_id} | {email}")
+                print(f"Tier: {cockpit_subscription_tier(account) or '-'}")
+                print(f"Model: {COCKPIT_IMAGE_MODEL}")
+            return 0
+        except Exception as exc:
+            failures.append(f"{email} ({account_id}): {exc}")
+            if args.no_account_failover:
+                break
+    raise SystemExit("All Cockpit account candidates failed:\n" + "\n".join(failures))
+
+
+async def generate_cockpit_with_account(
+    args: argparse.Namespace,
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    email = str(account.get("email") or "-")
+    account_id = str(account.get("id") or "-")
+    access_token = await asyncio.to_thread(refresh_cockpit_access_token, account, args)
+    token = account.get("token") if isinstance(account.get("token"), dict) else {}
+    project_id = token.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        project_id = await asyncio.to_thread(fetch_cockpit_project_id, access_token, args)
+    body = build_cockpit_body(args, project_id)
+    payload = await asyncio.to_thread(request_cockpit_image, access_token, body, args)
+    images = extract_cockpit_images(payload)
+    if not images:
+        raise RuntimeError("generateContent returned no inline image")
+
+    out_dir = Path(args.output_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = args.prefix or "banana_pro_cockpit"
+    saved: list[dict[str, Any]] = []
+    for index, (mime_type, image_bytes) in enumerate(images, start=1):
+        path = out_dir / f"{prefix}_generated_{index}{cockpit_extension(mime_type)}"
+        path.write_bytes(image_bytes)
+        saved.append(
+            {
+                "path": str(path),
+                "type": "generated",
+                "mime_type": mime_type,
+            }
+        )
+    return {
+        "text": "",
+        "images": saved,
+        "chat_id": None,
+        "auth_source": "cockpit",
+        "account_source": f"cockpit:{account_id}",
+        "account_profile": "",
+        "account_emails": [email] if email != "-" else [],
+        "account_tier": cockpit_subscription_tier(account) or None,
+        "model": COCKPIT_IMAGE_MODEL,
+    }
+
+
+def load_batch_manifest(path_value: str | Path) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
+    path = Path(path_value).expanduser().resolve()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"Could not read batch manifest: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid batch manifest JSON: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("Batch manifest root must be a JSON object.")
+    defaults = payload.get("defaults") or {}
+    tasks = payload.get("tasks")
+    if not isinstance(defaults, dict):
+        raise SystemExit("Batch manifest 'defaults' must be an object.")
+    if not isinstance(tasks, list) or not tasks:
+        raise SystemExit("Batch manifest requires a non-empty 'tasks' array.")
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            raise SystemExit(f"Batch task {index} must be an object.")
+        task_id = task.get("id")
+        prompt = task.get("prompt")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise SystemExit(f"Batch task {index} requires a non-empty string 'id'.")
+        if task_id in seen_ids:
+            raise SystemExit(f"Duplicate batch task id: {task_id}")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise SystemExit(f"Batch task {task_id} requires a non-empty string 'prompt'.")
+        images = task.get("images", task.get("image", []))
+        if isinstance(images, str):
+            images = [images]
+        if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
+            raise SystemExit(f"Batch task {task_id} 'images' must be a string array.")
+        seen_ids.add(task_id)
+        normalized.append({**task, "id": task_id.strip(), "prompt": prompt, "images": images})
+    return path, defaults, normalized
+
+
+def resolve_manifest_path(value: str, manifest_dir: Path) -> str:
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else (manifest_dir / path).resolve())
+
+
+def build_batch_task_args(
+    batch_args: argparse.Namespace,
+    manifest_path: Path,
+    defaults: dict[str, Any],
+    task: dict[str, Any],
+) -> argparse.Namespace:
+    task_args = argparse.Namespace(**vars(batch_args))
+    manifest_dir = manifest_path.parent
+    task_args.prompt = task["prompt"]
+    task_args.image = [
+        resolve_manifest_path(value, manifest_dir)
+        for value in task.get("images", [])
+    ]
+    output_dir = task.get("output_dir", defaults.get("output_dir", "./outputs"))
+    task_args.output_dir = resolve_manifest_path(str(output_dir), manifest_dir)
+    task_args.prefix = str(task.get("prefix", defaults.get("prefix", task["id"])))
+    task_args.size = task.get("size", defaults.get("size"))
+    task_args.quality = task.get("quality", defaults.get("quality"))
+    task_args.image_size = task.get("image_size", defaults.get("image_size"))
+    return task_args
+
+
+def batch_existing_images(task_args: argparse.Namespace) -> list[str]:
+    out_dir = Path(task_args.output_dir).expanduser()
+    if not out_dir.exists():
+        return []
+    prefix = task_args.prefix or "banana_pro_cockpit"
+    return sorted(str(path) for path in out_dir.glob(f"{prefix}_generated_*.*") if path.is_file())
+
+
+def write_batch_status(
+    status_path: Path,
+    manifest_path: Path,
+    accounts: list[dict[str, Any]],
+    results: dict[str, dict[str, Any]],
+) -> None:
+    counts = {"pass": 0, "fail": 0, "skipped": 0, "pending": 0}
+    for result in results.values():
+        status = result.get("status", "pending")
+        counts[status if status in counts else "pending"] += 1
+    payload = {
+        "manifest": str(manifest_path),
+        "updated_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "model": COCKPIT_IMAGE_MODEL,
+        "accounts": [
+            {
+                "id": account.get("id"),
+                "email": account.get("email"),
+                "tier": cockpit_subscription_tier(account),
+            }
+            for account in accounts
+        ],
+        "counts": counts,
+        "tasks": [results[key] for key in sorted(results)],
+    }
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = status_path.with_suffix(status_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(status_path)
+
+
+async def run_cockpit_batch(args: argparse.Namespace) -> int:
+    if args.auth_source != "cockpit":
+        raise SystemExit("batch currently requires --auth-source cockpit")
+    manifest_path, defaults, tasks = load_batch_manifest(args.manifest)
+    accounts = select_cockpit_accounts(args)
+    if args.account_tier == "pro":
+        accounts = [account for account in accounts if cockpit_is_pro(account)]
+        if not accounts:
+            raise SystemExit("No enabled image-capable Cockpit PRO accounts are available.")
+    worker_count = min(args.workers or len(accounts), len(accounts))
+    accounts = accounts[:worker_count]
+    status_path = (
+        Path(args.status_file).expanduser().resolve()
+        if args.status_file
+        else manifest_path.with_name(manifest_path.stem + "_status.json")
+    )
+    results: dict[str, dict[str, Any]] = {}
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    for task in tasks:
+        task_args = build_batch_task_args(args, manifest_path, defaults, task)
+        existing = batch_existing_images(task_args) if args.resume else []
+        if existing:
+            results[task["id"]] = {
+                "id": task["id"],
+                "status": "skipped",
+                "reason": "existing_output",
+                "images": existing,
+                "output_dir": task_args.output_dir,
+            }
+            continue
+        results[task["id"]] = {
+            "id": task["id"],
+            "status": "pending",
+            "output_dir": task_args.output_dir,
+            "failed_accounts": [],
+            "attempts": [],
+        }
+        queue.put_nowait(
+            {
+                "task": task,
+                "args": task_args,
+                "failed_accounts": set(),
+            }
+        )
+    write_batch_status(status_path, manifest_path, accounts, results)
+
+    async def worker(account: dict[str, Any]) -> None:
+        account_id = str(account.get("id") or "-")
+        email = str(account.get("email") or "-")
+        while True:
+            state = await queue.get()
+            if state is None:
+                queue.task_done()
+                return
+            task = state["task"]
+            task_id = task["id"]
+            failed_accounts: set[str] = state["failed_accounts"]
+            if account_id in failed_accounts:
+                queue.put_nowait(state)
+                queue.task_done()
+                await asyncio.sleep(0.05)
+                continue
+            started_at = datetime.now(tz=timezone.utc)
+            try:
+                result = await generate_cockpit_with_account(state["args"], account)
+                attempt = {
+                    "account_id": account_id,
+                    "account_email": email,
+                    "started_at": started_at.isoformat().replace("+00:00", "Z"),
+                    "finished_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "status": "pass",
+                }
+                results[task_id] = {
+                    "id": task_id,
+                    "status": "pass",
+                    "account_id": account_id,
+                    "account_email": email,
+                    "account_tier": cockpit_subscription_tier(account),
+                    "started_at": attempt["started_at"],
+                    "finished_at": attempt["finished_at"],
+                    "output_dir": state["args"].output_dir,
+                    "images": result["images"],
+                    "attempts": [*results[task_id].get("attempts", []), attempt],
+                }
+            except Exception as exc:
+                failed_accounts.add(account_id)
+                attempt = {
+                    "account_id": account_id,
+                    "account_email": email,
+                    "started_at": started_at.isoformat().replace("+00:00", "Z"),
+                    "finished_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "status": "fail",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                attempts = [*results[task_id].get("attempts", []), attempt]
+                if len(failed_accounts) < len(accounts):
+                    results[task_id] = {
+                        "id": task_id,
+                        "status": "pending",
+                        "output_dir": state["args"].output_dir,
+                        "failed_accounts": sorted(failed_accounts),
+                        "last_error": attempt["error"],
+                        "attempts": attempts,
+                    }
+                    queue.put_nowait(state)
+                else:
+                    results[task_id] = {
+                        "id": task_id,
+                        "status": "fail",
+                        "output_dir": state["args"].output_dir,
+                        "failed_accounts": sorted(failed_accounts),
+                        "error": attempt["error"],
+                        "attempts": attempts,
+                    }
+            finally:
+                write_batch_status(status_path, manifest_path, accounts, results)
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker(account)) for account in accounts]
+    await queue.join()
+    for _ in workers:
+        queue.put_nowait(None)
+    await queue.join()
+    await asyncio.gather(*workers)
+    write_batch_status(status_path, manifest_path, accounts, results)
+    summary = {
+        "manifest": str(manifest_path),
+        "status_file": str(status_path),
+        "workers": len(accounts),
+        "accounts": [
+            {
+                "id": account.get("id"),
+                "email": account.get("email"),
+                "tier": cockpit_subscription_tier(account),
+            }
+            for account in accounts
+        ],
+        "counts": {
+            status: sum(1 for result in results.values() if result.get("status") == status)
+            for status in ["pass", "fail", "skipped", "pending"]
+        },
+    }
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        print(f"Batch manifest: {manifest_path}")
+        print(f"Status file: {status_path}")
+        print(f"Workers: {len(accounts)}")
+        print("Counts: " + ", ".join(f"{key}={value}" for key, value in summary["counts"].items()))
+    return 0 if summary["counts"]["fail"] == 0 and summary["counts"]["pending"] == 0 else 1
+
+
 async def run_models(args: argparse.Namespace) -> int:
+    if args.auth_source == "cockpit":
+        rows = [
+            {
+                "id": account.get("id"),
+                "email": account.get("email"),
+                "models": cockpit_model_names(account),
+                "subscription_tier": cockpit_subscription_tier(account),
+            }
+            for account in select_cockpit_accounts(args)
+        ]
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            for row in rows:
+                print(f"cockpit:{row['id']} | {row['email']} | {', '.join(row['models']) or '-'}")
+        return 0
+
     client, json_cookies, cookie_path = await init_client(args)
     try:
         models = client.list_models() or []
@@ -708,6 +1435,32 @@ async def run_models(args: argparse.Namespace) -> int:
 
 
 async def run_inspect(args: argparse.Namespace) -> int:
+    if args.auth_source == "cockpit":
+        rows = [
+            {
+                "id": account.get("id"),
+                "email": account.get("email"),
+                "disabled": bool(account.get("disabled")),
+                "has_refresh_token": bool(
+                    isinstance(account.get("token"), dict)
+                    and account["token"].get("refresh_token")
+                ),
+                "image_model_available": COCKPIT_IMAGE_MODEL in cockpit_model_names(account),
+                "models": cockpit_model_names(account),
+                "subscription_tier": cockpit_subscription_tier(account),
+            }
+            for account in select_cockpit_accounts(args)
+        ]
+        payload = {
+            "auth_source": "cockpit",
+            "accounts_dir": str(cockpit_accounts_dir(args)),
+            "account_count": len(rows),
+            "image_model": COCKPIT_IMAGE_MODEL,
+            "accounts": rows,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
     client, json_cookies, cookie_path = await init_client(args)
     try:
         models = client.list_models() or []
@@ -725,6 +1478,29 @@ async def run_inspect(args: argparse.Namespace) -> int:
 
 
 async def run_auth(args: argparse.Namespace) -> int:
+    if args.auth_source == "cockpit":
+        accounts = select_cockpit_accounts(args)
+        payload = {
+            "auth_source": "cockpit",
+            "accounts_dir": str(cockpit_accounts_dir(args)),
+            "account_count": len(accounts),
+            "accounts": [
+                {
+                    "id": account.get("id"),
+                    "email": account.get("email"),
+                    "has_refresh_token": bool(
+                        isinstance(account.get("token"), dict)
+                        and account["token"].get("refresh_token")
+                    ),
+                    "image_model_available": COCKPIT_IMAGE_MODEL in cockpit_model_names(account),
+                    "subscription_tier": cockpit_subscription_tier(account),
+                }
+                for account in accounts
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
     cookies, cookie_path = ensure_cookie_file(args)
     source = None
     result = {
@@ -794,6 +1570,26 @@ async def run_auth(args: argparse.Namespace) -> int:
 
 
 async def run_accounts(args: argparse.Namespace) -> int:
+    if args.auth_source == "cockpit":
+        rows = [
+            {
+                "source": f"cockpit:{account.get('id')}",
+                "email": account.get("email"),
+                "disabled": bool(account.get("disabled")),
+                "models": cockpit_model_names(account),
+                "image_model_available": COCKPIT_IMAGE_MODEL in cockpit_model_names(account),
+                "subscription_tier": cockpit_subscription_tier(account),
+            }
+            for account in load_cockpit_accounts(args)
+        ]
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            for row in rows:
+                status = "image-ready" if row["image_model_available"] else "image-model-missing"
+                print(f"{row['source']} | {row['email']} | {status}")
+        return 0
+
     rows: list[dict[str, Any]] = []
     for profile_name, cookie_path in chrome_profile_cookie_paths():
         profile_info = read_chrome_profile_info(profile_name)
@@ -835,7 +1631,20 @@ async def run_accounts(args: argparse.Namespace) -> int:
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--auth-source",
+        choices=["web", "cockpit"],
+        default="web",
+        help="Authentication/backend source: Gemini Web cookies or Cockpit Antigravity OAuth",
+    )
     parser.add_argument("--cookies-json", default=None, help="Gemini web cookies JSON path")
+    parser.add_argument(
+        "--cockpit-dir",
+        default=None,
+        help="Cockpit data directory, defaults to ~/.antigravity_cockpit",
+    )
+    parser.add_argument("--cockpit-account-id", default=None, help="Select a Cockpit Antigravity account by id")
+    parser.add_argument("--cockpit-account-email", default=None, help="Select a Cockpit Antigravity account by email")
     parser.add_argument("--proxy", default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"))
     parser.add_argument("--account-index", type=int, default=None)
     parser.add_argument("--model", default=Model.UNSPECIFIED.model_name)
@@ -865,6 +1674,51 @@ def add_image_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--save-web-images", action="store_true")
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--temporary", action="store_true", help="Do not save conversation to Gemini history")
+    parser.add_argument("--size", default=None, help='Cockpit aspect ratio or dimensions, e.g. "16:9" or "1920x1080"')
+    parser.add_argument(
+        "--quality",
+        choices=["standard", "1k", "medium", "2k", "hd", "4k"],
+        default=None,
+        help="Cockpit image quality shortcut",
+    )
+    parser.add_argument(
+        "--image-size",
+        choices=["1K", "2K", "4K", "1k", "2k", "4k"],
+        default=None,
+        help="Cockpit direct image size override",
+    )
+
+
+def add_batch_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--manifest", required=True, help="JSON manifest containing defaults and tasks")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Concurrent workers/accounts. Default: all selected accounts up to task count.",
+    )
+    parser.add_argument(
+        "--account-tier",
+        choices=["pro", "all"],
+        default="pro",
+        help="Use PRO accounts only by default, or all enabled image-capable accounts.",
+    )
+    parser.add_argument("--status-file", default=None, help="Batch status JSON output path")
+    parser.add_argument("--resume", dest="resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.set_defaults(
+        prompt="",
+        image=[],
+        output_dir="./outputs",
+        prefix=None,
+        size=None,
+        quality=None,
+        image_size=None,
+        full_size=True,
+        save_web_images=False,
+        stream=False,
+        temporary=False,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -878,6 +1732,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_edit = sub.add_parser("edit", help="Image editing with Nano Banana Pro")
     add_common(p_edit)
     add_image_args(p_edit)
+
+    p_batch = sub.add_parser("batch", help="Run a JSON image-task manifest across Cockpit accounts concurrently")
+    add_common(p_batch)
+    add_batch_args(p_batch)
 
     p_models = sub.add_parser("models", help="List Gemini models available to the account")
     add_common(p_models)
@@ -902,6 +1760,8 @@ async def dispatch(args: argparse.Namespace) -> int:
         if not args.image:
             raise SystemExit("edit requires at least one --image")
         return await run_image(args)
+    if args.command == "batch":
+        return await run_cockpit_batch(args)
     if args.command == "models":
         return await run_models(args)
     if args.command == "inspect":

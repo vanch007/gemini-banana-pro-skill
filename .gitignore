@@ -7,3 +7,6 @@ cookies.json
 *cookies*.json
 outputs/
 temp/
+
+*.log
+*batch_status*.json

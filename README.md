@@ -1,10 +1,52 @@
 # gemini-banana-pro
 
-Standalone Gemini Web Nano Banana Pro CLI for image generation and image editing.
+Standalone Gemini image CLI for generation and editing through either Gemini
+Web cookies or Cockpit Tools Antigravity accounts.
 
 This project is self-contained. It vendors the required `gemini_webapi` runtime
 under `vendor/gemini_webapi`, so it does not depend on a local `Gemini-API`
 checkout.
+
+## Cockpit Tools Authentication
+
+Cockpit Tools Antigravity accounts can be used directly without converting
+their OAuth tokens into Gemini Web cookies:
+
+```bash
+python3 scripts/banana_pro.py generate \
+  "A premium red lantern product photo on a dark wooden table" \
+  --auth-source cockpit \
+  --size 16:9 \
+  --image-size 2K \
+  --output-dir ./outputs
+```
+
+The CLI reads `~/.antigravity_cockpit/accounts`, refreshes the selected Google
+OAuth token in memory, and calls Antigravity's image route with
+`gemini-3.1-flash-image`. It does not modify Cockpit account files.
+
+Use `--cockpit-account-email <email>` or `--cockpit-account-id <id>` to select
+one account. Otherwise the current Cockpit PRO account is preferred, followed
+by other PRO accounts and then FREE accounts.
+
+## Multi-account Batch
+
+Run a JSON task manifest across multiple Cockpit accounts:
+
+```bash
+python3 scripts/banana_pro.py batch \
+  --auth-source cockpit \
+  --manifest ./listing_batch.json \
+  --workers 4 \
+  --account-tier pro \
+  --status-file ./listing_batch_status.json
+```
+
+Each worker is pinned to one account. Tasks that fail on one account are
+requeued for another selected account. Existing prefixed outputs are skipped
+when resume mode is enabled. The atomic status JSON retains every account
+attempt, including quota failures and the account that ultimately produced the
+image.
 
 ## Output Resolution
 
