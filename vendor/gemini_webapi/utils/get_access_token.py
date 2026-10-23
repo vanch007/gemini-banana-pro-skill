@@ -274,13 +274,13 @@ async def get_access_token(
             session_id = re.search(r'"FdrFJe":\s*"(.*?)"', response.text)
             language = re.search(r'"TuX5cc":\s*"(.*?)"', response.text)
             push_id = re.search(r'"qKIAYe":\s*"(.*?)"', response.text)
-            if access_token or build_label or session_id or language or push_id:
+            if access_token:
                 if verbose:
                     logger.debug(
                         f"Init attempt ({current_attempt}) from {group_name} succeeded."
                     )
                 return (
-                    access_token.group(1) if access_token else None,
+                    access_token.group(1),
                     build_label.group(1) if build_label else None,
                     session_id.group(1) if session_id else None,
                     language.group(1) if language else None,

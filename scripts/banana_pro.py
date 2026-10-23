@@ -182,6 +182,9 @@ USEFUL_COOKIE_NAMES = {
     "SSID",
     "APISID",
     "SAPISID",
+    "COMPASS",
+    "__Secure-STRP",
+    "AEC",
 }
 
 
@@ -857,8 +860,11 @@ async def inspect_cookie_account(args: argparse.Namespace, cookies: dict[str, st
             verbose=args.verbose,
         )
         models = client.list_models() or []
+        status_name = getattr(client.account_status, "name", str(client.account_status))
+        if getattr(client, "access_token", None):
+            status_name = "AVAILABLE"
         return {
-            "account_status": getattr(client.account_status, "name", str(client.account_status)),
+            "account_status": status_name,
             "model_count": len(models),
             "models": [
                 {
